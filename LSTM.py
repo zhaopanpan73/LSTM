@@ -87,11 +87,138 @@ class PTBModel(object):
         # 然后定义优化器_trian_op，用optimizer.apply_gradients将前面clip过的梯度应用到所有可以训练的参数tvars上，
         # 然后使用tf.contrib.framework.get_or_create_global_step生成全局统一的训练步数。
         self._lr=tf.Variable(0.0,trainable=False)   # 原来对变量可以设置训不训练
-        tvars=tf.trianable_variables()  # 这样就全部获得了可训练的参数。
+        tvars=tf.trianable_variables()  # 这样就全部获得了可训练的参数。 # -------------************************----------------------
         # tf.trainable_variables返回的是需要训练的变量列表（只要变量在定义的时候没有trainable=False就算），tf.all_variables返回的是所有变量的列表
         grads,_=tf.clip_by_average_norm(tf.gradients(cost,tvars),config.max_grad_norm)  # 在这里设置的梯度裁剪
         optimizer=tf.trian.GradientDescentOptimizer(self._lr)
         self._trian_op=optimizer.apply_gradients(zip(grads,tvars),global_step=tf.contrib.framework.get_or_create_global_step()) # 将裁剪过的梯度用到所有可训练的参数tvars上
+
+        # 这里设置一个名为_new_lr(new learning rate)的placeholder用以控制学习速率，同时，定义操作_lr_update，它使用tf.assign将_new_lr的值赋给当前的学习速率_lr，
+        # 再定义一个assign_lr的函数，用来在外部控制模型的学习速率，方式是将学习速率值传入_new_lr这个placeholder，并执行_update_lr操作完成对学习率的修改
+        # 上面说self._lr不可训练，但是可以通过session对其进行修改，人为控制_lr的变化
+        self._new_lr=tf.placeholder(tf.float32,shape=[],name="new_learning_rate")  # 这个place_holder,可以通过session传入值
+        self._lr_update=tf.assign(self._lr,self._new_lr)  # tf.assign(A, new_number): 这个函数的功能主要是把A的值变为new_number
+        # tf.assign(ref, value, validate_shape=None, use_locking=None,name=None)
+        # ref: A mutable Tensor. Should be from a Variable node. May be uninitialized.
+        # 这里有一个问题，这里没有对self._lr直接赋值，而是用了一个place_holder对传入传入新值，然后用用这个place_holder的值对原始的不可训练的self._lr进行赋值
+        # 应该是为了通过session动态传值进行修改吧
+
+        def assign_lr(self,session,lr_value):  # 函数的目的：通过在外部来控制模型的学习速率
+            session.run(self._lr_update,feed_dict={self._new_lr:lr_value})
+
+        # 至此，模型的定义部分就完成了。我们再定义一个PTBMdel class的一些property
+        # 在Python中的@property装饰器可以将返回变量设置为只读，防止修改变量引发的问题。
+        # 这里定义 input,initial_state,cost,final_state,lr,train_op为property，以便外部访问。
+
+    @property
+    def input(self):
+        return  self._input
+
+    @property
+    def initial_state(self):
+        return self._initial_state
+
+    @property
+    def cost(self):
+        return  self._cost
+
+    @property
+    def final_state(self):
+        return  self._final_state
+
+    @property
+    def lr(self):
+        return  self._lr
+
+    @property
+    def train_op(self):
+        return self._train_op
+
+
+
+
+    # 接下来定义几种不同大小的模型参数。
+    # 首先是小模型的参数，下面解释各个参数的含义
+    # init_scale是昂罗中的权重值的初始scale.
+    # learning_rate是学习速率的初始值
+    # max_grad_norm即前面提到的梯度的最大范数
+    # num_layers是LSTM堆叠的层数
+    # num_steps 是LSTM反向传播的展开步数
+    # hidden_size是LSTM内的隐含节点数
+    # max_epoch是初始学习率可训练的epoch数，在此之后需要调整学习率
+    # max_max_epoch是总共可训练的epoch
+    # keep_prob是dropout层的保留节点的比例
+    # lr_decay是学习速率的衰减速度
+    # batch_size是每个batch中样本的数量。
+    # 具体每个参数的值，在不配置中对比才有意义
+    # 接下来我们会在几个配置中讨论具体数值
+class SmallConfig(object):
+  """Small config."""
+  init_scale = 0.1
+  learning_rate = 1.0
+  max_grad_norm = 5
+  num_layers = 2
+  num_steps = 20
+  hidden_size = 200
+  max_epoch = 4
+  max_max_epoch = 13
+  keep_prob = 1.0
+  lr_decay = 0.5
+  batch_size = 20
+  vocab_size = 10000
+
+
+class MediumConfig(object):
+  """Medium config."""
+  init_scale = 0.05
+  learning_rate = 1.0
+  max_grad_norm = 5
+  num_layers = 2
+  num_steps = 35
+  hidden_size = 650
+  max_epoch = 6
+  max_max_epoch = 39
+  keep_prob = 0.5
+  lr_decay = 0.8
+  batch_size = 20
+  vocab_size = 10000
+
+
+class LargeConfig(object):
+  """Large config."""
+  init_scale = 0.04
+  learning_rate = 1.0
+  max_grad_norm = 10
+  num_layers = 2
+  num_steps = 35
+  hidden_size = 1500
+  max_epoch = 14
+  max_max_epoch = 55
+  keep_prob = 0.35
+  lr_decay = 1 / 1.15
+  batch_size = 20
+  vocab_size = 10000
+
+class TestConfig(object):
+  """Tiny config, for testing."""
+  init_scale = 0.1
+  learning_rate = 1.0
+  max_grad_norm = 1
+  num_layers = 1
+  num_steps = 2
+  hidden_size = 2
+  max_epoch = 1
+  max_max_epoch = 1
+  keep_prob = 1.0
+  lr_decay = 0.5
+  batch_size = 20
+  vocab_size = 10000
+
+
+
+
+
+
 
 
 
