@@ -3,9 +3,48 @@
 # git clone https://github.com/tensorflow/models.git
 # cd models/tutorials/rnn/ptb
 # import time
+
+# To run:
+# $ python ptb_word_lm.py --data_path=simple-examples/data/
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import time
+
 import numpy as np
 import tensorflow as tf
+
 import reader
+import util
+
+from tensorflow.python.client import device_lib
+
+flags = tf.flags
+logging = tf.logging
+
+flags.DEFINE_string(
+    "model", "small",
+    "A type of model. Possible options are: small, medium, large.")
+flags.DEFINE_string("data_path", None,
+                    "Where the training/test data is stored.")
+flags.DEFINE_string("save_path", None,
+                    "Model output directory.")
+flags.DEFINE_bool("use_fp16", False,
+                  "Train using 16-bit floats instead of 32bit floats")
+flags.DEFINE_integer("num_gpus", 1,
+                     "If larger than 1, Grappler AutoParallel optimizer "
+                     "will create multiple training replicas with each GPU "
+                     "running one replica.")
+flags.DEFINE_string("rnn_mode", None,
+                    "The low level implementation of lstm cell: one of CUDNN, "
+                    "BASIC, and BLOCK, representing cudnn_lstm, basic_lstm, "
+                    "and lstm_block_cell classes.")
+FLAGS = flags.FLAGS
+BASIC = "basic"
+CUDNN = "cudnn"
+BLOCK = "block"
 
 
 # 定义语言模型处理输入数据的Class  PTBInput
@@ -213,6 +252,147 @@ class TestConfig(object):
   lr_decay = 0.5
   batch_size = 20
   vocab_size = 10000
+
+# 下面定义训练一个epoch数据的函数run_epoch。我们记录当前的时间，初始化损失costs和迭代数iters,并执行model.initial_state来初始化状并取得初始状态
+# 接着创建输出结果的字典表fetches，其中包括xost和final_state,如果有评测操作eval_op，也一并加入fetches。接着我们进入循环中，次数即为epoch_size。
+# 在每次循环中，我们生成训练用的fect_dit，，将全部的LSTM单元的state加入feet_dict中，然后传入feet_dict并执行fetches对网络进行一次训练。并拿到cost和state.
+# 这里我们每完成约10%的epoch，就进行一次结果的展示，一次展示当前的epoch的进度，perplexity（即平均cost的自然常数指数，是语言模型中用来比较模型性能的重要指标，越低代表模型输出的概率分布在预测样本上越好）和训练速度（单词数每秒）
+# 最后返回perplexity作为函数的结果
+
+def run_epoch(session,model,eval_op=None,verbose=False):
+    start_time=time.time()
+    costs=0.0
+    iters=0
+    # state=session.run(model.initial_state)  # 取得网络当前的状态，# 然后看这epoch_size
+    # 从网络中要得到的数据
+    fetches={"cost":model.cost,"final_state":model.final_state}
+    if eval_op is not None:
+        fetches["eval_op"]=eval_op
+    for step in range(model.input.epoch_size):
+        feed_dict={}  # 馈送进网络的数据
+        for i ,(c,h) in enumerate(model.initial_state):
+            feed_dict[c]=state[i].c
+            feed_dict[h]=state[i].h
+        # 我送入一次数据到一个cell,然后得到这个cell的代价和最终状态
+        vals=session.run(fetches,feed_dict)
+        cost=vals["cost"]
+        state=vals["final_state"]
+        cost+=cost
+        iters+=model.input.num_steps  # LSTM向后展开的步数
+
+        if verbose and step % (model.input.epoch_size // 10) == 10:
+            print("%.3f perplexity: %.3f speed: %.0f wps" %
+                  (step * 1.0 / model.input.epoch_size, np.exp(costs / iters),
+                   iters * model.input.batch_size * max(1, FLAGS.num_gpus) /
+                   (time.time() - start_time)))
+
+        return np.exp(costs / iters)
+
+def get_config():
+  """Get model config."""
+  config = None
+  if FLAGS.model == "small":
+    config = SmallConfig()
+  elif FLAGS.model == "medium":
+    config = MediumConfig()
+  elif FLAGS.model == "large":
+    config = LargeConfig()
+  elif FLAGS.model == "test":
+    config = TestConfig()
+  else:
+    raise ValueError("Invalid model: %s", FLAGS.model)
+  if FLAGS.rnn_mode:
+    config.rnn_mode = FLAGS.rnn_mode
+  if FLAGS.num_gpus != 1 or tf.__version__ < "1.3.0" :
+    config.rnn_mode = BASIC
+  return config
+
+
+def main(_):
+  if not FLAGS.data_path:
+    raise ValueError("Must set --data_path to PTB data directory")
+  gpus = [
+      x.name for x in device_lib.list_local_devices() if x.device_type == "GPU"
+  ]
+  if FLAGS.num_gpus > len(gpus):
+    raise ValueError(
+        "Your machine has only %d gpus "
+        "which is less than the requested --num_gpus=%d."
+        % (len(gpus), FLAGS.num_gpus))
+
+  raw_data = reader.ptb_raw_data(FLAGS.data_path)
+  train_data, valid_data, test_data, _ = raw_data
+
+  config = get_config()
+  eval_config = get_config()
+  eval_config.batch_size = 1
+  eval_config.num_steps = 1
+
+  with tf.Graph().as_default():
+    initializer = tf.random_uniform_initializer(-config.init_scale,
+                                                config.init_scale)
+
+    with tf.name_scope("Train"):
+      train_input = PTBInput(config=config, data=train_data, name="TrainInput")
+      with tf.variable_scope("Model", reuse=None, initializer=initializer):
+        m = PTBModel(is_training=True, config=config, input_=train_input)
+      tf.summary.scalar("Training Loss", m.cost)
+      tf.summary.scalar("Learning Rate", m.lr)
+
+    with tf.name_scope("Valid"):
+      valid_input = PTBInput(config=config, data=valid_data, name="ValidInput")
+      with tf.variable_scope("Model", reuse=True, initializer=initializer):
+        mvalid = PTBModel(is_training=False, config=config, input_=valid_input)
+      tf.summary.scalar("Validation Loss", mvalid.cost)
+
+    with tf.name_scope("Test"):
+      test_input = PTBInput(
+          config=eval_config, data=test_data, name="TestInput")
+      with tf.variable_scope("Model", reuse=True, initializer=initializer):
+        mtest = PTBModel(is_training=False, config=eval_config,
+                         input_=test_input)
+
+    models = {"Train": m, "Valid": mvalid, "Test": mtest}
+    for name, model in models.items():
+      model.export_ops(name)
+    metagraph = tf.train.export_meta_graph()
+    if tf.__version__ < "1.1.0" and FLAGS.num_gpus > 1:
+      raise ValueError("num_gpus > 1 is not supported for TensorFlow versions "
+                       "below 1.1.0")
+    soft_placement = False
+    if FLAGS.num_gpus > 1:
+      soft_placement = True
+      util.auto_parallel(metagraph, m)
+
+  with tf.Graph().as_default():
+    tf.train.import_meta_graph(metagraph)
+    for model in models.values():
+      model.import_ops()
+    sv = tf.train.Supervisor(logdir=FLAGS.save_path)
+    config_proto = tf.ConfigProto(allow_soft_placement=soft_placement)
+    with sv.managed_session(config=config_proto) as session:
+      for i in range(config.max_max_epoch):
+        lr_decay = config.lr_decay ** max(i + 1 - config.max_epoch, 0.0)
+        m.assign_lr(session, config.learning_rate * lr_decay)
+
+        print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
+        train_perplexity = run_epoch(session, m, eval_op=m.train_op,
+                                     verbose=True)
+        print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
+        valid_perplexity = run_epoch(session, mvalid)
+        print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
+
+      test_perplexity = run_epoch(session, mtest)
+      print("Test Perplexity: %.3f" % test_perplexity)
+
+      if FLAGS.save_path:
+        print("Saving model to %s." % FLAGS.save_path)
+        sv.saver.save(session, FLAGS.save_path, global_step=sv.global_step)
+
+
+if __name__ == "__main__":
+  tf.app.run()
+
 
 
 
